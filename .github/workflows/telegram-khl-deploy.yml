@@ -8,67 +8,16 @@ on:
       - '.github/workflows/telegram-khl-deploy.yml'
 
 jobs:
-  deploy-and-send:
+  check-netlify-auth:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Decode bot and PDF
-        shell: bash
-        run: |
-          set -euo pipefail
-          rm -rf /tmp/loko-khl /tmp/bot.zip
-          mkdir -p /tmp/loko-khl/bot
-          base64 -d telegram-bot-deploy/bot-v10_3.zip.b64 > /tmp/bot.zip
-          unzip -q /tmp/bot.zip -d /tmp/loko-khl/bot
-          base64 -d telegram-bot-deploy/KHL_LokoPK_2026-09-22.pdf.b64 > /tmp/loko-khl/KHL_LokoPK_2026-09-22.pdf
-          test -s /tmp/loko-khl/KHL_LokoPK_2026-09-22.pdf
-          test -f /tmp/loko-khl/bot/netlify.toml
-          file /tmp/loko-khl/KHL_LokoPK_2026-09-22.pdf
-
-      - name: Add one-time KHL PDF sender
-        shell: bash
-        run: |
-          set -euo pipefail
-          cd /tmp/loko-khl
-          PDF_B64=$(base64 -w0 KHL_LokoPK_2026-09-22.pdf)
-          cat > bot/netlify/functions/khl-send-once.mjs <<EOF
-          import { getOwner, getJSON, setJSON } from "../lib/store.mjs";
-          import { sendDocument } from "../lib/telegram.mjs";
-
-          const KEY = "khl-once/2026-09-22-lokopk.json";
-          const PDF_BASE64 = "${PDF_B64}";
-
-          export default async () => {
-            const already = await getJSON(KEY, null);
-            if (already?.sentAt) return;
-            const owner = await getOwner();
-            if (!owner?.chatId) return;
-            const buffer = Buffer.from(PDF_BASE64, "base64");
-            const result = await sendDocument(owner.chatId, {
-              buffer,
-              filename: "KHL_LokoPK_2026-09-22.pdf",
-              caption: "<b>🏒 КХЛ · ЛокоПК</b>\nПрогнозный отчёт на 22.09.2026\n5 двойных экспрессов · аналитика и риски",
-            });
-            await setJSON(KEY, { sentAt: new Date().toISOString(), messageId: result?.message_id || null });
-          };
-          EOF
-          cat >> bot/netlify.toml <<'EOF'
-
-          [functions."khl-send-once"]
-            schedule = "* * * * *"
-          EOF
-
-      - name: Deploy to Netlify production
+      - name: Check Netlify token availability
         shell: bash
         env:
           NETLIFY_AUTH_TOKEN: ${{ secrets.NETLIFY_AUTH_TOKEN }}
         run: |
-          set -euo pipefail
           if [ -z "${NETLIFY_AUTH_TOKEN:-}" ]; then
             echo "NETLIFY_AUTH_TOKEN repository secret is not configured"
             exit 2
           fi
-          cd /tmp/loko-khl/bot
-          npx -y netlify-cli@latest deploy --prod --dir public --functions netlify/functions --site c13bf7d3-d6ed-45ed-a941-32fbca8ecf99 --auth "$NETLIFY_AUTH_TOKEN"
+          echo "Netlify deploy authorization is configured"
