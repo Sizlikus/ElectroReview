@@ -14,16 +14,23 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Unpack bot bundle
+      - name: Decode bot and PDF
         shell: bash
         run: |
-          rm -rf /tmp/loko-khl
-          mkdir -p /tmp/loko-khl
-          unzip -q telegram-bot-deploy/telegram_khl_deploy_bundle.zip -d /tmp/loko-khl
+          set -euo pipefail
+          rm -rf /tmp/loko-khl /tmp/bot.zip
+          mkdir -p /tmp/loko-khl/bot
+          base64 -d telegram-bot-deploy/bot-v10_3.zip.b64 > /tmp/bot.zip
+          unzip -q /tmp/bot.zip -d /tmp/loko-khl/bot
+          base64 -d telegram-bot-deploy/KHL_LokoPK_2026-09-22.pdf.b64 > /tmp/loko-khl/KHL_LokoPK_2026-09-22.pdf
+          test -s /tmp/loko-khl/KHL_LokoPK_2026-09-22.pdf
+          test -f /tmp/loko-khl/bot/netlify.toml
+          file /tmp/loko-khl/KHL_LokoPK_2026-09-22.pdf
 
       - name: Add one-time KHL PDF sender
         shell: bash
         run: |
+          set -euo pipefail
           cd /tmp/loko-khl
           PDF_B64=$(base64 -w0 KHL_LokoPK_2026-09-22.pdf)
           cat > bot/netlify/functions/khl-send-once.mjs <<EOF
@@ -38,18 +45,13 @@ jobs:
             if (already?.sentAt) return;
             const owner = await getOwner();
             if (!owner?.chatId) return;
-            try {
-              const buffer = Buffer.from(PDF_BASE64, "base64");
-              const result = await sendDocument(owner.chatId, {
-                buffer,
-                filename: "KHL_LokoPK_2026-09-22.pdf",
-                caption: "<b>🏒 КХЛ · ЛокоПК</b>\nПрогнозный отчёт на 22.09.2026\n5 двойных экспрессов · аналитика и риски",
-              });
-              await setJSON(KEY, { sentAt: new Date().toISOString(), messageId: result?.message_id || null });
-            } catch (e) {
-              console.error("khl-send-once failed", e);
-              throw e;
-            }
+            const buffer = Buffer.from(PDF_BASE64, "base64");
+            const result = await sendDocument(owner.chatId, {
+              buffer,
+              filename: "KHL_LokoPK_2026-09-22.pdf",
+              caption: "<b>🏒 КХЛ · ЛокоПК</b>\nПрогнозный отчёт на 22.09.2026\n5 двойных экспрессов · аналитика и риски",
+            });
+            await setJSON(KEY, { sentAt: new Date().toISOString(), messageId: result?.message_id || null });
           };
           EOF
           cat >> bot/netlify.toml <<'EOF'
@@ -58,14 +60,15 @@ jobs:
             schedule = "* * * * *"
           EOF
 
-      - name: Deploy to existing Netlify project
+      - name: Deploy to Netlify production
         shell: bash
+        env:
+          NETLIFY_AUTH_TOKEN: ${{ secrets.NETLIFY_AUTH_TOKEN }}
         run: |
+          set -euo pipefail
+          if [ -z "${NETLIFY_AUTH_TOKEN:-}" ]; then
+            echo "NETLIFY_AUTH_TOKEN repository secret is not configured"
+            exit 2
+          fi
           cd /tmp/loko-khl/bot
-          npx -y @netlify/mcp@latest --site-id c13bf7d3-d6ed-45ed-a941-32fbca8ecf99 --proxy-path "https://netlify-mcp.netlify.app/proxy/eyJhbGciOiJkaXIiLCJlbmMiOiJBMjU2R0NNIn0..0nb3tv7xogeEOMHD._iNNlv_pxDxHEhYSyni-MQs0gcmy04Bqnx_S5iMwoQYsrCVgsucToZ94lm_ontdPVJ7JIexeAavLuTNvr2KLdUgLX8Ml_1cx7ZFfgo5YlrZCtZNhVP3TK5TuvTZ7aMUL7sJoDBbhTWWPhuwJwhN4UWgq09ZNYi3wWYoLbhd0S9D795J00T86J1T5Ct3K-Pj_8V1GqIVVYd4GPk73Xy331YV7iqs4ByeWmmrZuVi74kNyIzNrHzUO_dr5WfAgdZo7x-HcIbBHLI4K3i_RnEiG29Waqwjrn_tbv0CVzGLv1Hg9N0mi6DLawIW3ml-xY0vXki6YNM5UhUckpk5VxJDbRhAvEwSLziZyuu2w6xLMWh00PmwKpCkQIt21oR67ARrJCWDfTDPf.cPojnyRGGPMOScLAAjB4Rw"
-
-      - name: Trigger one-time PDF send
-        shell: bash
-        run: |
-          curl -fsS --retry 8 --retry-all-errors --retry-delay 5 \
-            https://football-pdf-telegram-bot.netlify.app/.netlify/functions/khl-send-once
+          npx -y netlify-cli@latest deploy --prod --dir public --functions netlify/functions --site c13bf7d3-d6ed-45ed-a941-32fbca8ecf99 --auth "$NETLIFY_AUTH_TOKEN"
