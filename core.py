@@ -123,14 +123,16 @@ def ocr_binary():
 def ocr_command():
     p=ocr_binary();cmd=[str(p)]
     data=p.parent/'tessdata'
-    return cmd,(['--tessdata-dir',str(data)] if data.is_dir() else [])
+    return cmd,(['--tessdata-dir','tessdata'] if data.is_dir() else [])
 
-def run_process(cmd,timeout=240):
+def run_process(cmd,timeout=240,input_bytes=None):
     flags={'creationflags':subprocess.CREATE_NO_WINDOW} if os.name=='nt' else {}
     env=os.environ.copy();env.pop('TESSDATA_PREFIX',None)
-    result=subprocess.run(cmd,capture_output=True,text=True,encoding='utf-8',errors='replace',timeout=timeout,env=env,**flags)
-    if result.returncode:raise RuntimeError(result.stderr[-1500:] or 'Ошибка OCR')
-    return result.stdout
+    # Windows CreateProcess accepts a Unicode working directory. Keep paths passed
+    # to Tesseract itself relative/ASCII: its narrow argv loses Cyrillic paths.
+    result=subprocess.run(cmd,capture_output=True,input=input_bytes,cwd=str(Path(cmd[0]).parent),timeout=timeout,env=env,**flags)
+    if result.returncode:raise RuntimeError(result.stderr.decode('utf-8','replace')[-1500:] or 'Ошибка OCR')
+    return result.stdout.decode('utf-8','replace')
 
 def languages():
     cmd,data=ocr_command();return run_process(cmd+data+['--list-langs'],30)
@@ -150,10 +152,9 @@ def parse_tsv(s,width,height):
 def ocr(image,lang='rus+eng'):
     available=languages().splitlines()
     if not set(lang.split('+')).issubset(set(available)):raise RuntimeError('В комплекте OCR нет требуемых языков: '+lang)
-    with tempfile.TemporaryDirectory() as temp:
-        p=Path(temp)/'page.png';image.save(p);cmd,data=ocr_command()
-        result=run_process(cmd+[str(p),'stdout']+data+['-l',lang,'--psm','11','tsv'])
-        return parse_tsv(result,image.width,image.height)
+    stream=io.BytesIO();image.save(stream,format='PNG');cmd,data=ocr_command()
+    result=run_process(cmd+['stdin','stdout']+data+['-l',lang,'--psm','11','tsv'],input_bytes=stream.getvalue())
+    return parse_tsv(result,image.width,image.height)
 
 def font_path():
     paths=[os.environ.get('ELECTROREVIEW_FONT',''),r'C:\Windows\Fonts\arial.ttf','/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf']

@@ -62,6 +62,20 @@ class Tests(unittest.TestCase):
         self.assertEqual(render(src,0).size,render(out,0).size);p.close()
     def test_source_export_protected(self):
         with self.assertRaises(ValueError):export(self.p,self.p.source)
+    def test_ocr_relative_data_and_stdin(self):
+        from unittest.mock import patch
+        import core
+        from PIL import Image
+        calls=[]
+        def fake_run(cmd,timeout=240,input_bytes=None):
+            calls.append((cmd,input_bytes))
+            if '--list-langs' in cmd:return 'List of available languages (2):\nrus\neng\n'
+            return 'level\tleft\ttop\twidth\theight\tconf\ttext\n5\t0\t0\t10\t10\t90\tC16\n'
+        with patch('core.ocr_command',return_value=(['C:/Проверка программы/ocr/tesseract.exe'],['--tessdata-dir','tessdata'])), patch('core.run_process',side_effect=fake_run):
+            words=core.ocr(Image.new('RGB',(20,20),'white'))
+        self.assertEqual(words[0]['text'],'C16')
+        self.assertIn('stdin',calls[1][0]);self.assertIn('tessdata',calls[1][0])
+        self.assertTrue(calls[1][1].startswith(b'\x89PNG'))
     def test_demo(self):
         p=create_demo(self.root/'demo');self.assertFalse(p.state['pages'][0]['has_text']);self.assertEqual(len(p.state['regions']),1);p.close()
 if __name__=='__main__':unittest.main()
