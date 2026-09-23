@@ -40,6 +40,7 @@ jobs:
         shell: pwsh
         run: ./scripts/build-windows.ps1
       - name: Test packaged EXE from a folder with spaces and Cyrillic
+        timeout-minutes: 4
         shell: pwsh
         run: |
           $testRoot = Join-Path $env:RUNNER_TEMP 'Проверка программы'
@@ -47,9 +48,9 @@ jobs:
           Copy-Item 'dist/ElectroReview' $testRoot -Recurse
           $exe = Join-Path $testRoot 'ElectroReview/ElectroReview.exe'
           $report = Join-Path $env:GITHUB_WORKSPACE 'packaged-selftest.json'
-          $process = Start-Process -FilePath $exe -ArgumentList @('--self-test', "`"$report`"") -PassThru
-          if (!$process.WaitForExit(180000)) { $process.Kill(); throw 'Self-test timed out' }
-          $process.Refresh()
+          $process = Start-Process -FilePath $exe -ArgumentList @('--self-test', "`"$report`"") -Wait -PassThru
+          if (Test-Path $report) { Get-Content $report -Raw }
+          Write-Host "Packaged process exit: $($process.ExitCode)"
           if ($process.ExitCode -ne 0) { throw 'Packaged application self-test failed' }
           if (!(Test-Path $report)) { throw 'No self-test report' }
           $result = Get-Content $report -Raw | ConvertFrom-Json
