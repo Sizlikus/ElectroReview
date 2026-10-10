@@ -63,6 +63,30 @@ def check_aes(temp, scan, checks):
         else:raise RuntimeError('PDF requiring a password was accepted')
         checks.append(algorithm+' password-required PDF: rejected with a clear error')
 
+def check_assistant(project,checks):
+    from http.server import BaseHTTPRequestHandler,HTTPServer
+    import threading
+    from assistant_api import request_drafts,page_regions
+    r=project.add(0,[.65,.35,.8,.45],'QF88 C20 NYM 3x4')
+    captured=[]
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            captured.append(json.loads(self.rfile.read(int(self.headers['Content-Length']))))
+            draft={'drafts':[{'source_ids':[r['id']],'data':{'name':'QF88','breaker_a':20},
+                    'field_sources':{'name':[r['id']],'breaker_a':[r['id']]},'warnings':['Synthetic draft only']}]}
+            body=json.dumps({'choices':[{'finish_reason':'stop','message':{'content':json.dumps(draft)}}]}).encode()
+            self.send_response(200);self.send_header('Content-Length',str(len(body)));self.end_headers();self.wfile.write(body)
+        def log_message(self,*args):pass
+    server=HTTPServer(('127.0.0.1',0),Handler);thread=threading.Thread(target=server.handle_request,daemon=True);thread.start()
+    try:
+        drafts=request_drafts({'endpoint':f'http://127.0.0.1:{server.server_port}/v1','model':'synthetic-selftest'},'',
+                              page_regions(project.state,0),0,render(project.source,0))
+    finally:thread.join(5);server.server_close()
+    image=captured[0]['messages'][1]['content'][1]['image_url']['url']
+    if not image.startswith('data:image/jpeg;base64,') or r['status']!='pending':raise RuntimeError('Vision payload or draft status invalid')
+    checks.append('Optional API: real local HTTP, synthetic OCR+JPEG request, validated draft; no external model called')
+    return drafts[0]
+
 def run(report):
     checks=[];p=None
     try:
@@ -84,6 +108,7 @@ def run(report):
             render(output,0);checks.append('PDF render, approved searchable Cyrillic and export')
             check_aes(Path(temp),p.source,checks)
             circuit=check_rules(p,Path(temp),checks)
+            draft=check_assistant(p,checks)
             import tkinter as tk
             from app import App
             root=tk.Tk();root.withdraw();app=App(root);app.replace(p);root.update_idletasks()
@@ -91,8 +116,16 @@ def run(report):
             from circuit_ui import CircuitDialog,CircuitManager
             dialog=CircuitDialog(app,circuit['source_ids'],circuit);root.update_idletasks();dialog.win.destroy()
             manager=CircuitManager(app);root.update_idletasks();manager.win.destroy()
+            from quick_ui import QuickReview,AssistantSettings
+            quick=QuickReview(app);root.update_idletasks()
+            dialog=CircuitDialog(app,draft['source_ids'],draft=draft,page=0);root.update_idletasks()
+            if dialog.confirm.get():raise RuntimeError('Human confirmation must default to false')
+            dialog.confirm.set(True);dialog.save();root.update_idletasks()
+            if not any(c['data']['name']=='QF88' for c in p.state['circuits']):raise RuntimeError('Guided batch approval failed')
+            quick.close();settings=AssistantSettings(app);root.update_idletasks();settings.win.destroy()
+            app.advanced.set(True);app.toggle_tools();root.update_idletasks()
             root.destroy();p.close();p=None
-            checks.append('Tk application, PDF, circuit editor and rule manager created')
+            checks.append('Tk application, guided review, original crop, batch approval/check, API settings, advanced tools and circuit manager')
         report.write_text(json.dumps({'version':VERSION,'status':'passed','checks':checks},ensure_ascii=False,indent=2),encoding='utf-8')
     except Exception:
         if p:p.close()

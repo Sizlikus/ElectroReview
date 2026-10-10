@@ -7,7 +7,7 @@ from pypdf import PdfReader, PdfWriter, Transformation
 from pypdf.annotations import Rectangle
 from pypdf.generic import RectangleObject, NameObject, ArrayObject, FloatObject, TextStringObject, NumberObject
 
-VERSION='0.3.0'
+VERSION='0.4.0'
 MAX_BYTES=100_000_000
 LABELS={'pending':'Ожидает подтверждения','approved':'Утверждено','excluded':'Исключено'}
 def now(): return datetime.now(timezone.utc).isoformat()
@@ -125,7 +125,35 @@ class Project:
             if not r or r['kind']!='reading' or r['status']!='approved':raise ValueError('Сначала утвердите все исходные чтения цепи')
             snapshot.append({k:r[k] for k in ('id','page','box','text','status')})
         return snapshot
-    def confirm_circuit(self,data,source_ids,reviewer,circuit_id=None):
+    def confirm_draft(self,data,edits,reviewer):
+        """One human decision approves chosen readings and a card, one disk commit.
+
+        Validate before any mutation. Restore in-memory state if saving fails.
+        AI/local suggestions never call this without the review dialog's consent.
+        """
+        from electrical import validate_data
+        data=validate_data(data)
+        if not reviewer.strip():raise ValueError('Укажите имя проверяющего')
+        if not edits:raise ValueError('Выберите исходные надписи цепи')
+        regions={r['id']:r for r in self.state['regions']}
+        for rid,text in edits.items():
+            r=regions.get(rid)
+            if not r or r['kind']!='reading' or r['status']=='excluded':raise ValueError('Исходная область недоступна')
+            if not isinstance(text,str) or not text.strip():raise ValueError('Исправьте пустые исходные надписи')
+        before=json.loads(json.dumps(self.state))
+        try:
+            for rid,text in edits.items():
+                r=regions[rid];old=dict(r)
+                r.update(text=text.strip(),status='approved',reviewer=reviewer.strip(),reviewed_at=now())
+                self.event(r,reviewer.strip(),old)
+                if old['text']!=r['text'] or old['status']!=r['status']:
+                    for c in self.state['circuits']:
+                        if rid in c['source_ids']:self.invalidate_circuit(c,reviewer.strip())
+            circuit=self.confirm_circuit(data,list(edits),reviewer,persist=False)
+            self.save();return circuit
+        except Exception:
+            self.state=before;raise
+    def confirm_circuit(self,data,source_ids,reviewer,circuit_id=None,persist=True):
         from electrical import validate_data
         if not reviewer.strip():raise ValueError('Укажите имя проверяющего')
         data=validate_data(data);snapshot=self.source_snapshot(source_ids)
@@ -141,7 +169,8 @@ class Project:
         if self.state.get('checks'):self.state['checks']['stale']=True
         self.state['audit'].append({'time':now(),'actor':reviewer.strip(),'id':circuit['id'],'type':'circuit',
                                    'before':before,'after':json.loads(json.dumps(circuit))})
-        self.save();return circuit
+        if persist:self.save()
+        return circuit
     def check_circuits(self,reviewer):
         from electrical import evaluate,RULESET,RULES,SOURCE,SOURCE_URL
         if not reviewer.strip():raise ValueError('Укажите имя проверяющего')

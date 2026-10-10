@@ -1,4 +1,4 @@
-import json, queue, sys, threading, traceback, uuid
+import json, queue, sys, threading, traceback, uuid, time
 from pathlib import Path
 import tkinter as tk
 from tkinter import ttk, filedialog, simpledialog, messagebox
@@ -9,6 +9,8 @@ class App:
     def __init__(self,root):
         self.root=root;root.title('ЭлектроКонтроль '+VERSION+' | 220–400 В');root.geometry('1400x900');root.minsize(1050,700)
         self.project=None;self.page=0;self.scale=1.3;self.selected=None;self.drag=None;self.busy=False;self.mode='reading';self.jobs=queue.Queue();self.ocr_repeat=False
+        from quick_ui import load_settings
+        self.ai_settings=load_settings();self.ai_key=''
         style=ttk.Style();style.theme_use('clam');style.configure('TButton',padding=7)
         bar=ttk.Frame(root,padding=8);bar.pack(fill='x')
         for label,fn in [('Открыть PDF',self.new),('Открыть проект',self.open),('Учебный пример',self.demo),('Экспорт PDF',self.export)]:
@@ -17,13 +19,19 @@ class App:
         ttk.Label(root,text='ДЕМО • 6 условных проверок ПУЭ по подтверждённым карточкам цепей. Жёлтый — требуется решение. Полная экспертиза не выполняется.',
                   background='#fff3c4',foreground='#75500c',padding=8).pack(fill='x')
         bar=ttk.Frame(root,padding=5);bar.pack(fill='x')
-        for label,fn in [('◀',lambda:self.navigate(-1)),('▶',lambda:self.navigate(1)),('−',lambda:self.zoom(-.2)),('+',lambda:self.zoom(.2)),
-                         ('OCR листа',self.read),('Жёлтая область',lambda:self.mode_set('reading')),('Замечание',lambda:self.mode_set('finding'))]:
+        for label,fn in [('◀',lambda:self.navigate(-1)),('▶',lambda:self.navigate(1)),('−',lambda:self.zoom(-.2)),('+',lambda:self.zoom(.2))]:
             ttk.Button(bar,text=label,command=fn).pack(side='left',padx=2)
         self.page_label=ttk.Label(bar);self.page_label.pack(side='left',padx=10)
         electrical_bar=ttk.Frame(root,padding=5);electrical_bar.pack(fill='x')
-        for label,fn in [('Разбор обозначений',self.labels),('Карточка цепи',self.circuit),('Цепи и правила',self.circuits),('Проверить цепи',self.checks)]:
+        self.electrical_bar=electrical_bar
+        for label,fn in [('Проверить лист',self.quick),('Настроить ИИ',self.assistant_settings),('Цепи и правила',self.circuits)]:
             ttk.Button(electrical_bar,text=label,command=fn).pack(side='left',padx=2)
+        self.advanced=tk.BooleanVar(value=False)
+        ttk.Checkbutton(electrical_bar,text='Расширенные инструменты',variable=self.advanced,command=self.toggle_tools).pack(side='left',padx=12)
+        self.tools=ttk.Frame(root,padding=5)
+        for label,fn in [('OCR листа',self.read),('Жёлтая область',lambda:self.mode_set('reading')),('Замечание',lambda:self.mode_set('finding')),
+                         ('Разбор обозначений',self.labels),('Карточка цепи',self.circuit),('Проверить цепи',self.checks)]:
+            ttk.Button(self.tools,text=label,command=fn).pack(side='left',padx=2)
         pane=ttk.Panedwindow(root,orient='horizontal');pane.pack(fill='both',expand=True)
         left=ttk.Frame(pane);right=ttk.Frame(pane,padding=8);pane.add(left,weight=4);pane.add(right,weight=1)
         self.canvas=tk.Canvas(left,background='#dae1e9',highlightthickness=0)
@@ -46,6 +54,9 @@ class App:
         self.status=tk.StringVar(value='Проекты сохраняются локально. Начните с учебного примера.')
         ttk.Label(root,textvariable=self.status,padding=7).pack(fill='x')
         root.after(150,self.poll);root.protocol('WM_DELETE_WINDOW',self.close)
+    def toggle_tools(self):
+        if self.advanced.get():self.tools.pack(after=self.electrical_bar,fill='x')
+        else:self.tools.pack_forget()
     def available(self):
         if self.busy:messagebox.showinfo('Обработка','Дождитесь завершения операции.');return False
         return True
@@ -135,21 +146,36 @@ class App:
             self.refresh();self.tree.selection_set(rid)
         except Exception as e:messagebox.showerror('Подтверждение',str(e))
     def start(self,fn,kind,label):
-        self.busy=True;self.status.set(label)
+        self.busy=True;self.started=time.monotonic();self.job_label=label;self.status.set(label)
         def worker():
             try:self.jobs.put((kind,fn()))
             except Exception as e:self.jobs.put(('error',str(e)))
         threading.Thread(target=worker,daemon=True).start()
     def poll(self):
+        if self.busy:self.status.set(self.job_label+f' • {int(time.monotonic()-self.started)} с')
         try:
             kind,value=self.jobs.get_nowait();self.busy=False
             if kind=='error':messagebox.showerror('Ошибка',value);self.status.set('Операция не выполнена: '+value)
             elif kind=='project':self.replace(value)
             elif kind=='ocr':self.project.ingest(self.page,value,repeat=self.ocr_repeat);self.refresh()
+            elif kind=='quick_ocr':
+                self.project.ingest(self.page,value);self.refresh()
+                from quick_ui import QuickReview
+                QuickReview(self)
             elif kind=='export':self.status.set('Сохранено: '+str(value));messagebox.showinfo('Готово','PDF сохранён: '+str(value))
         except queue.Empty:pass
         except Exception as e:messagebox.showerror('Ошибка',str(e))
         self.root.after(150,self.poll)
+    def quick(self):
+        if not self.available() or not self.project or not self.unsaved_ok():return
+        if not self.actor.get().strip():messagebox.showinfo('Проверяющий','Введите имя проверяющего вверху окна.');return
+        from quick_ui import QuickReview
+        if self.project.state['pages'][self.page]['ocr']=='done':QuickReview(self)
+        else:self.start(lambda:ocr_directions(render(self.project.source,self.page,300/72)),'quick_ocr','Шаг 1: распознавание листа 0° / ±90°…')
+    def assistant_settings(self):
+        if not self.available():return
+        from quick_ui import AssistantSettings
+        AssistantSettings(self)
     def read(self):
         if not self.available() or not self.project or not self.unsaved_ok():return
         self.ocr_repeat=self.project.state['pages'][self.page]['ocr']=='done'
