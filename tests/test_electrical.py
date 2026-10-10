@@ -145,8 +145,8 @@ class WorkflowTests(unittest.TestCase):
         output=export(self.p,self.root/'stale.pdf');text='\n'.join(p.extract_text() for p in PdfReader(output).pages)
         self.assertIn('РЕЗУЛЬТАТЫ УСТАРЕЛИ',text)
     def test_old_project_without_new_fields(self):
-        self.p.close();path=self.root/'project/project.json';state=json.loads(path.read_text())
-        state.pop('circuits',None);state.pop('checks',None);path.write_text(json.dumps(state))
+        self.p.close();path=self.root/'project/project.json';state=json.loads(path.read_text(encoding='utf-8'))
+        state.pop('circuits',None);state.pop('checks',None);path.write_text(json.dumps(state),encoding='utf-8')
         self.p=Project(self.root/'project');self.assertEqual(self.p.state['circuits'],[]);self.assertIsNone(self.p.state['checks'])
     def test_repeat_ocr_preserves_confirmed_text_and_avoids_duplicates(self):
         text=self.r['text'];box=self.r['box']
