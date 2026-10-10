@@ -233,7 +233,7 @@ def parse_tsv(s,width,height):
         words.append(word)
     return words
 
-def ocr(image,lang='rus+eng'):
+def ocr(image,lang='eng+rus'):
     available=languages().splitlines()
     if not set(lang.split('+')).issubset(set(available)):raise RuntimeError('В комплекте OCR нет требуемых языков: '+lang)
     stream=io.BytesIO();image.save(stream,format='PNG');cmd,data=ocr_command()
