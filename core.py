@@ -7,7 +7,7 @@ from pypdf import PdfReader, PdfWriter, Transformation
 from pypdf.annotations import Rectangle
 from pypdf.generic import RectangleObject, NameObject, ArrayObject, FloatObject, TextStringObject, NumberObject
 
-VERSION='0.2.1'
+VERSION='0.3.0'
 MAX_BYTES=100_000_000
 LABELS={'pending':'Ожидает подтверждения','approved':'Утверждено','excluded':'Исключено'}
 def now(): return datetime.now(timezone.utc).isoformat()
@@ -40,6 +40,7 @@ class Project:
         self.folder=Path(folder);self.source=self.folder/'source.pdf';self.path=self.folder/'project.json';self.lock=None
         self.state=json.loads(self.path.read_text(encoding='utf-8'))
         if self.state.get('schema')!=2: raise ValueError('Неподдерживаемый формат проекта')
+        self.state.setdefault('circuits',[]);self.state.setdefault('checks',None)
         if hashlib.sha256(self.source.read_bytes()).hexdigest()!=self.state['sha256']: raise ValueError('Исходный PDF изменён')
         for r in self.state['regions']:box_valid(r['box'])
         self.lock=open(self.folder/'.lock','a+b');self.lock.seek(0)
@@ -98,17 +99,98 @@ class Project:
         if not reviewer.strip():raise ValueError('Укажите имя проверяющего')
         if status not in LABELS:raise ValueError('Неизвестный статус')
         r=next(r for r in self.state['regions'] if r['id']==rid)
+        if r.get('superseded') and status=='approved':raise ValueError('Это замечание устарело. Подтвердите карточку цепи и повторите проверку.')
         if status=='approved' and not text.strip():raise ValueError('Введите подтверждённый текст')
         if status=='approved' and r['kind']=='finding' and not basis.strip():raise ValueError('Укажите основание замечания')
         before=dict(r);r.update(text=text.strip(),reviewer=reviewer.strip(),status=status,basis=basis.strip(),reviewed_at=now())
-        self.event(r,reviewer.strip(),before);self.save()
-    def ingest(self,page,words):
-        if self.state['pages'][page]['ocr']=='done':raise ValueError('OCR уже выполнен')
+        self.event(r,reviewer.strip(),before)
+        if r['kind']=='reading' and (before['text']!=r['text'] or before['status']!=r['status']):
+            for circuit in self.state['circuits']:
+                if rid in circuit['source_ids']:self.invalidate_circuit(circuit,reviewer.strip())
+        self.save()
+    def invalidate_circuit(self,circuit,actor):
+        if circuit['status']!='stale':
+            self.state['audit'].append({'time':now(),'actor':actor,'id':circuit['id'],'type':'circuit_invalidated','reason':'Исходное чтение или карточка изменены'})
+        circuit['status']='stale';self.state['normative_status']='stale'
+        if self.state.get('checks'):self.state['checks']['stale']=True
+        for r in self.state['regions']:
+            if r.get('circuit_id')==circuit['id'] and not r.get('superseded'):
+                before=dict(r);r.update(status='excluded',superseded=True)
+                self.event(r,actor,before)
+    def source_snapshot(self,source_ids):
+        by_id={r['id']:r for r in self.state['regions']};snapshot=[]
+        if not source_ids:raise ValueError('Выберите подтверждённую область схемы для привязки цепи')
+        for rid in dict.fromkeys(source_ids):
+            r=by_id.get(rid)
+            if not r or r['kind']!='reading' or r['status']!='approved':raise ValueError('Сначала утвердите все исходные чтения цепи')
+            snapshot.append({k:r[k] for k in ('id','page','box','text','status')})
+        return snapshot
+    def confirm_circuit(self,data,source_ids,reviewer,circuit_id=None):
+        from electrical import validate_data
+        if not reviewer.strip():raise ValueError('Укажите имя проверяющего')
+        data=validate_data(data);snapshot=self.source_snapshot(source_ids)
+        circuit=next((c for c in self.state['circuits'] if c['id']==circuit_id),None)
+        if circuit_id and not circuit:raise ValueError('Цепь не найдена')
+        before=json.loads(json.dumps(circuit)) if circuit else None
+        if circuit:self.invalidate_circuit(circuit,reviewer)
+        else:
+            circuit={'id':uuid.uuid4().hex};self.state['circuits'].append(circuit)
+        circuit.update(data=data,source_ids=[s['id'] for s in snapshot],snapshot=snapshot,status='confirmed',
+                       reviewer=reviewer.strip(),confirmed_at=now())
+        self.state['normative_status']='stale' if self.state.get('checks') else 'not_run'
+        if self.state.get('checks'):self.state['checks']['stale']=True
+        self.state['audit'].append({'time':now(),'actor':reviewer.strip(),'id':circuit['id'],'type':'circuit',
+                                   'before':before,'after':json.loads(json.dumps(circuit))})
+        self.save();return circuit
+    def check_circuits(self,reviewer):
+        from electrical import evaluate,RULESET,RULES,SOURCE,SOURCE_URL
+        if not reviewer.strip():raise ValueError('Укажите имя проверяющего')
+        if not self.state['circuits']:raise ValueError('Сначала создайте и подтвердите карточку цепи')
+        results=[]
+        for c in self.state['circuits']:
+            try:current=self.source_snapshot(c['source_ids'])
+            except ValueError:current=None
+            if c['status']!='confirmed' or current!=c['snapshot']:
+                self.invalidate_circuit(c,reviewer)
+                rows=[{'rule':key,'clause':clause,'title':title,'status':'not_checked',
+                       'message':'Карточка устарела: требуется повторное подтверждение исходных данных.',
+                       'severity':None,'source_url':SOURCE_URL,'ruleset':RULESET} for key,clause,title in RULES]
+            else:rows=evaluate(c['data'])
+            results.append({'circuit_id':c['id'],'name':c['data']['name'],'data':dict(c['data']),
+                            'snapshot':c['snapshot'],'reviewer':c['reviewer'],'rows':rows})
+            for row in rows:
+                if row['status']!='violation':continue
+                pages={s['page'] for s in c['snapshot']}
+                for page in pages:
+                    signature=hashlib.sha256(json.dumps([c['id'],c['data'],c['snapshot'],RULESET,row['rule'],page],sort_keys=True).encode()).hexdigest()
+                    if any(r.get('check_key')==signature and not r.get('superseded') for r in self.state['regions']):continue
+                    boxes=[s['box'] for s in c['snapshot'] if s['page']==page]
+                    box=[min(b[0] for b in boxes),min(b[1] for b in boxes),max(b[2] for b in boxes),max(b[3] for b in boxes)]
+                    text=c['data']['name']+' • '+row['title']+'\n'+row['message']
+                    basis=SOURCE+'; п. '+row['clause']+'\n'+SOURCE_URL+'\nИсточник данных: '+c['data']['evidence']+'\nПредварительное замечание по подтверждённой карточке. Требуется решение проверяющего.'
+                    r=self.add(page,box,text,kind='finding',severity=row['severity'],basis=basis,engine='rules '+RULESET,persist=False)
+                    r.update(circuit_id=c['id'],rule=row['rule'],check_key=signature,superseded=False)
+        self.state['checks']={'time':now(),'reviewer':reviewer.strip(),'ruleset':RULESET,'source':SOURCE,
+                              'source_url':SOURCE_URL,'stale':False,'circuits':results}
+        self.state['normative_status']='partial'
+        self.state['audit'].append({'time':now(),'actor':reviewer.strip(),'id':'checks','type':'checks',
+                                   'ruleset':RULESET,'circuits':len(results)})
+        self.save();return self.state['checks']
+    def ingest(self,page,words,repeat=False):
+        if self.state['pages'][page]['ocr']=='done' and not repeat:raise ValueError('OCR уже выполнен')
         # Validate all data before mutating the project.
         for w in words:box_valid(w['box'])
-        for w in words:self.add(page,w['box'],w['text'],confidence=w['confidence'],engine='Tesseract rus+eng',persist=False)
+        for w in words:
+            duplicate=False
+            if repeat:
+                x,y,a,b=w['box']
+                for r in self.state['regions']:
+                    if r['page']!=page or r['kind']!='reading' or r['status']=='excluded' or r['text'].casefold()!=w['text'].casefold():continue
+                    u,v,m,n=r['box'];intersection=max(0,min(a,m)-max(x,u))*max(0,min(b,n)-max(y,v))
+                    if intersection/max(min((a-x)*(b-y),(m-u)*(n-v)),1e-10)>.8:duplicate=True;break
+            if not duplicate:self.add(page,w['box'],w['text'],confidence=w['confidence'],engine='Tesseract rus+eng',persist=False)
         if not words:self.add(page,[.01,.01,.99,.99],basis='OCR не обнаружил текст. Проверьте лист вручную.',engine='Tesseract rus+eng')
-        self.state['pages'][page]['ocr']='done';self.save()
+        self.state['pages'][page].update(ocr='done',ocr_version=VERSION);self.save()
 
 
 def ocr_binary():
@@ -146,7 +228,9 @@ def parse_tsv(s,width,height):
         b=[max(0,x/width),max(0,y/height),min(1,(x+w)/width),min(1,(y+h)/height)]
         try:box_valid(b)
         except ValueError:continue
-        words.append({'text':text,'box':b,'confidence':max(0,min(100,float(r['conf'])))})
+        word={'text':text,'box':b,'confidence':max(0,min(100,float(r['conf'])))}
+        if all(r.get(k) for k in ('block_num','par_num','line_num')):word['line_id']=tuple(r[k] for k in ('block_num','par_num','line_num'))
+        words.append(word)
     return words
 
 def ocr(image,lang='rus+eng'):
@@ -155,6 +239,34 @@ def ocr(image,lang='rus+eng'):
     stream=io.BytesIO();image.save(stream,format='PNG');cmd,data=ocr_command()
     result=run_process(cmd+['stdin','stdout']+data+['-l',lang,'--psm','11','tsv'],input_bytes=stream.getvalue())
     return parse_tsv(result,image.width,image.height)
+
+def group_ocr_lines(words):
+    groups={}
+    for index,word in enumerate(words):groups.setdefault(word.get('line_id',('single',index)),[]).append(word)
+    lines=[]
+    for group in groups.values():
+        ordered=sorted(group,key=lambda w:w['box'][0]);boxes=[w['box'] for w in ordered]
+        lines.append({'text':' '.join(w['text'] for w in ordered),'box':[min(b[0] for b in boxes),min(b[1] for b in boxes),max(b[2] for b in boxes),max(b[3] for b in boxes)],
+                      'confidence':min(w['confidence'] for w in ordered)})
+    return lines
+
+def ocr_directions(image):
+    """0 / ±90-degree passes, mapped back to original display coordinates."""
+    result=group_ocr_lines(ocr(image))
+    for angle in (90,270):
+        rotated=group_ocr_lines(ocr(image.rotate(angle,expand=True)))
+        for word in rotated:
+            x,y,a,b=word['box'];box=[1-b,x,1-y,a] if angle==90 else [y,1-a,b,1-x]
+            mapped=dict(word,box=box,orientation=angle);box_valid(box)
+            # Retain disagreements for manual review rather than silently choosing.
+            duplicate=False
+            for existing in result:
+                if existing['text'].casefold()!=mapped['text'].casefold():continue
+                u,v,w,h=existing['box'];k,l,m,n=box
+                intersection=max(0,min(w,m)-max(u,k))*max(0,min(h,n)-max(v,l))
+                if intersection/max(min((w-u)*(h-v),(m-k)*(n-l)),1e-10)>.5:duplicate=True;break
+            if not duplicate:result.append(mapped)
+    return result
 
 def font_path():
     paths=[os.environ.get('ELECTROREVIEW_FONT',''),r'C:\Windows\Fonts\arial.ttf','/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf']
@@ -207,11 +319,26 @@ def export(project,dest):
     def paragraph(t,style='Normal'):
         story.extend([Paragraph(escape(t).replace('\n','<br/>'),styles[style]),Spacer(1,8)])
     paragraph('ЭлектроКонтроль • ведомость','Title');paragraph(project.state['name'])
-    paragraph('Демо '+VERSION+'. Автоматическая нормативная проверка НЕ выполнена. Отсутствие замечаний не означает соответствия нормам. Жёлтый — подтвердить; красный — утверждённое замечание.')
+    checks=project.state.get('checks')
+    if checks:
+        paragraph('Демо '+VERSION+'. Выполнен ограниченный набор проверок по подтверждённым карточкам цепей. Это не полная проверка проекта и не заключение о соответствии нормам. Жёлтый — требуется решение; красный — утверждённое замечание.')
+    else:
+        paragraph('Демо '+VERSION+'. Автоматическая нормативная проверка НЕ выполнена. Отсутствие замечаний не означает соответствия нормам. Жёлтый — подтвердить; красный — утверждённое замечание.')
     paragraph('Новый поисковый слой содержит только подтверждённые чтения на страницах без исходного текста. На смешанных страницах чтения приведены в ведомости. Номера ниже — страницы PDF. Критичность — экспертный индекс, не вероятность аварии.')
+    if checks:
+        from electrical import OUTCOMES,data_description
+        paragraph('Ограниченная проверка цепей','Heading1')
+        if checks.get('stale'):paragraph('РЕЗУЛЬТАТЫ УСТАРЕЛИ: исходные чтения или карточки изменены. Подтвердите карточки и выполните проверку снова.')
+        paragraph(checks['source']+'\n'+checks['source_url']+'\nНабор: '+checks['ruleset']+'; время: '+checks['time']+'; проверяющий: '+checks['reviewer'])
+        paragraph('Не проверялись: токи КЗ, время отключения, селективность, допустимый ток кабеля, падение напряжения, УЗО, уравнивание потенциалов, прочие нормы и полнота проекта. Не внесённые в карточки цепи не проверены. Индекс 100% — критичное предварительное замечание; 0% как оценка безопасности не присваивается.')
+        for entry in checks['circuits']:
+            paragraph(entry['name'],'Heading2');paragraph(data_description(entry['data']))
+            paragraph('Подтвердил: '+entry['reviewer']+'\nИсходные чтения: '+'; '.join('стр. '+str(s['page']+1)+': '+s['text'] for s in entry['snapshot']))
+            for row in entry['rows']:
+                paragraph('ПУЭ '+row['clause']+' • '+OUTCOMES[row['status']]+'\n'+row['message'])
     for n,r in enumerate(project.state['regions'],1):
         paragraph(f"{n}. Страница {r['page']+1} • {LABELS[r['status']]}",'Heading3')
-        paragraph(f"Текст: {r['text'] or '(не распознан)'}\nИсходное чтение: {r['original'] or '(нет)'}\nОснование: {r['basis'] or '(нет)'}\nПроверяющий: {r['reviewer'] or '(нет)'}\nКритичность: {str(r['severity'])+'%' if r['kind']=='finding' else 'не назначается для чтения'}")
+        paragraph(f"Текст: {r['text'] or '(не распознан)'}\nИсходное чтение: {r['original'] or '(нет)'}\nОснование: {r['basis'] or '(нет)'}\nПроверяющий: {r['reviewer'] or '(нет)'}\nКритичность: {str(r['severity'])+'%' if r['kind']=='finding' else 'не назначается для чтения'}" + ('\nУСТАРЕЛО: не использовать это замечание.' if r.get('superseded') else ''))
     SimpleDocTemplate(stream,rightMargin=40,leftMargin=40,topMargin=40,bottomMargin=40).build(story)
     for p in PdfReader(stream).pages:writer.add_page(p)
     fd,temp=tempfile.mkstemp(dir=dest.parent,suffix='.pdf')

@@ -3,24 +3,27 @@ from pathlib import Path
 import tkinter as tk
 from tkinter import ttk, filedialog, simpledialog, messagebox
 from PIL import ImageTk
-from core import Project, render, ocr, export, create_demo, home, LABELS, VERSION
+from core import Project, render, ocr_directions, export, create_demo, home, LABELS, VERSION
 
 class App:
     def __init__(self,root):
         self.root=root;root.title('ЭлектроКонтроль '+VERSION+' | 220–400 В');root.geometry('1400x900');root.minsize(1050,700)
-        self.project=None;self.page=0;self.scale=1.3;self.selected=None;self.drag=None;self.busy=False;self.mode='reading';self.jobs=queue.Queue()
+        self.project=None;self.page=0;self.scale=1.3;self.selected=None;self.drag=None;self.busy=False;self.mode='reading';self.jobs=queue.Queue();self.ocr_repeat=False
         style=ttk.Style();style.theme_use('clam');style.configure('TButton',padding=7)
         bar=ttk.Frame(root,padding=8);bar.pack(fill='x')
         for label,fn in [('Открыть PDF',self.new),('Открыть проект',self.open),('Учебный пример',self.demo),('Экспорт PDF',self.export)]:
             ttk.Button(bar,text=label,command=fn).pack(side='left',padx=3)
         self.actor=tk.StringVar();ttk.Label(bar,text=' Проверяющий:').pack(side='left');ttk.Entry(bar,textvariable=self.actor,width=22).pack(side='left')
-        ttk.Label(root,text='ДЕМО • Автоматическая проверка норм пока не выполняется. Жёлтый — требуется подтверждение чтения.',
+        ttk.Label(root,text='ДЕМО • 6 условных проверок ПУЭ по подтверждённым карточкам цепей. Жёлтый — требуется решение. Полная экспертиза не выполняется.',
                   background='#fff3c4',foreground='#75500c',padding=8).pack(fill='x')
         bar=ttk.Frame(root,padding=5);bar.pack(fill='x')
         for label,fn in [('◀',lambda:self.navigate(-1)),('▶',lambda:self.navigate(1)),('−',lambda:self.zoom(-.2)),('+',lambda:self.zoom(.2)),
                          ('OCR листа',self.read),('Жёлтая область',lambda:self.mode_set('reading')),('Замечание',lambda:self.mode_set('finding'))]:
             ttk.Button(bar,text=label,command=fn).pack(side='left',padx=2)
         self.page_label=ttk.Label(bar);self.page_label.pack(side='left',padx=10)
+        electrical_bar=ttk.Frame(root,padding=5);electrical_bar.pack(fill='x')
+        for label,fn in [('Разбор обозначений',self.labels),('Карточка цепи',self.circuit),('Цепи и правила',self.circuits),('Проверить цепи',self.checks)]:
+            ttk.Button(electrical_bar,text=label,command=fn).pack(side='left',padx=2)
         pane=ttk.Panedwindow(root,orient='horizontal');pane.pack(fill='both',expand=True)
         left=ttk.Frame(pane);right=ttk.Frame(pane,padding=8);pane.add(left,weight=4);pane.add(right,weight=1)
         self.canvas=tk.Canvas(left,background='#dae1e9',highlightthickness=0)
@@ -85,7 +88,8 @@ class App:
             x,y,a,b=r['box'];self.canvas.create_rectangle(x*self.im.width,y*self.im.height,a*self.im.width,b*self.im.height,
                 outline=color,width=2,fill=color if r['status']=='pending' else '',stipple='gray12',tags='region')
         count=sum(r['status']=='pending' for r in self.project.state['regions'])
-        self.status.set(f'Ожидают решения: {count} | Проект: {self.project.folder}')
+        checks=self.project.state.get('checks');check_status='не запускались' if not checks else ('устарели' if checks.get('stale') else '6 правил, частично')
+        self.status.set(f'Ожидают решения: {count} | Карточки: {len(self.project.state["circuits"])} | Проверки: {check_status} | Проект: {self.project.folder}')
     def navigate(self,d):
         if self.available() and self.project and self.unsaved_ok():self.page=max(0,min(len(self.project.state['pages'])-1,self.page+d));self.show()
     def zoom(self,d):
@@ -141,15 +145,55 @@ class App:
             kind,value=self.jobs.get_nowait();self.busy=False
             if kind=='error':messagebox.showerror('Ошибка',value);self.status.set('Операция не выполнена: '+value)
             elif kind=='project':self.replace(value)
-            elif kind=='ocr':self.project.ingest(self.page,value);self.refresh()
+            elif kind=='ocr':self.project.ingest(self.page,value,repeat=self.ocr_repeat);self.refresh()
             elif kind=='export':self.status.set('Сохранено: '+str(value));messagebox.showinfo('Готово','PDF сохранён: '+str(value))
         except queue.Empty:pass
         except Exception as e:messagebox.showerror('Ошибка',str(e))
         self.root.after(150,self.poll)
     def read(self):
         if not self.available() or not self.project or not self.unsaved_ok():return
-        if self.project.state['pages'][self.page]['ocr']=='done':messagebox.showinfo('OCR','Этот лист уже распознан.');return
-        self.start(lambda:ocr(render(self.project.source,self.page,300/72)),'ocr','Распознавание rus+eng… Все чтения потребуют подтверждения.')
+        self.ocr_repeat=self.project.state['pages'][self.page]['ocr']=='done'
+        if self.ocr_repeat and not messagebox.askyesno('Повторное OCR','Добавить новые чтения? Существующие области и решения сохранятся. Новые результаты потребуют подтверждения.'):return
+        self.start(lambda:ocr_directions(render(self.project.source,self.page,300/72)),'ocr','Распознавание 0° / ±90° rus+eng… Все чтения потребуют подтверждения.')
+    def labels(self):
+        if not self.available() or not self.project or not self.unsaved_ok():return
+        from electrical import parse_labels
+        from circuit_ui import readonly_text
+        rows=[r for r in self.project.state['regions'] if r['page']==self.page and r['kind']=='reading' and r['status']!='excluded']
+        parts=['Обозначения из чтений текущего листа — кандидаты, не установленная схема соединений.',
+               'Разбор не исправляет похожие буквы и цифры. Связи, PE/PEN и параметры подтверждаются в карточке.']
+        for r in rows:
+            candidates=parse_labels(r['text'])
+            if candidates:
+                lines=[]
+                for c in candidates:
+                    if c['kind']=='cable':detail='Кабель: '+c['raw']+'; жил: '+str(c['cores'])+'; сечение фазы: '+('требует уточнения' if c['phase_mm2'] is None else str(c['phase_mm2'])+' мм²')
+                    elif c['kind']=='device':detail='Аппарат: '+c['designation']
+                    elif c['kind']=='breaker':detail='Характеристика / ток: '+c['curve']+' '+str(c['amps'])+' А'
+                    elif c['kind']=='rcd':detail='Дифференциальный ток: '+str(c['ma'])+' мА'
+                    else:detail='Обозначение системы / проводника: '+c['raw']
+                    lines.append(detail)
+                parts.append('\nИсходное чтение ['+LABELS[r['status']]+']: '+r['text']+'\n'+'\n'.join(lines))
+        if len(parts)==2:parts.append('Обозначения не найдены. Выполните OCR или вручную выделите область и подтвердите текст.')
+        win=tk.Toplevel(self.root);win.title('Разбор обозначений');win.geometry('850x650');readonly_text(win,'\n\n'.join(parts))
+    def circuit(self):
+        if not self.available() or not self.project or not self.unsaved_ok():return
+        from circuit_ui import CircuitDialog
+        ids=list(self.tree.selection())
+        try:self.project.source_snapshot(ids)
+        except Exception as e:messagebox.showinfo('Исходные надписи',str(e));return
+        CircuitDialog(self,ids)
+    def circuits(self):
+        if not self.available() or not self.project or not self.unsaved_ok():return
+        from circuit_ui import CircuitManager
+        CircuitManager(self)
+    def checks(self):
+        if not self.available() or not self.project or not self.unsaved_ok():return
+        from circuit_ui import readonly_text,checks_text
+        try:
+            self.project.check_circuits(self.actor.get());self.refresh()
+            win=tk.Toplevel(self.root);win.title('Результат ограниченной проверки');win.geometry('920x720');readonly_text(win,checks_text(self.project))
+        except Exception as e:messagebox.showerror('Проверка',str(e))
     def export(self):
         if not self.available() or not self.project or not self.unsaved_ok():return
         dest=filedialog.asksaveasfilename(defaultextension='.pdf',initialfile='Результат-проверки.pdf',filetypes=[('PDF','*.pdf')])
