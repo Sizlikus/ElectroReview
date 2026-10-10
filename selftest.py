@@ -2,8 +2,35 @@
 import json, os, sys, tempfile, traceback
 from pathlib import Path
 from PIL import Image, ImageDraw, ImageFont
-from pypdf import PdfReader
-from core import create_demo, export, render, ocr, ocr_binary, bundle, font_path, VERSION
+from pypdf import PdfReader, PdfWriter
+from core import Project, read_pdf, create_demo, export, render, ocr, ocr_binary, bundle, font_path, VERSION
+
+def check_aes(temp, scan, checks):
+    """Exercise encrypted scanned input using the same import/render/export as the UI."""
+    for algorithm in ('AES-128', 'AES-256'):
+        source=temp/(algorithm+'.pdf')
+        writer=PdfWriter(clone_from=scan)
+        writer.encrypt('', owner_password='self-test-owner', algorithm=algorithm)
+        writer.write(source)
+        if not PdfReader(source).is_encrypted:raise RuntimeError('Fixture is not encrypted')
+        project=Project.create(source,temp/algorithm)
+        try:
+            if render(project.source,0).size!=render(scan,0).size:raise RuntimeError('AES page dimensions changed')
+            r=project.add(0,[.1,.1,.3,.2],'КАБЕЛЬ C16')
+            project.decide(r['id'],'КАБЕЛЬ C16','Self-test','approved')
+            output=export(project,temp/(algorithm+'-result.pdf'))
+            reader=PdfReader(output)
+            if reader.is_encrypted or 'КАБЕЛЬ' not in reader.pages[0].extract_text():
+                raise RuntimeError('AES export/searchable Cyrillic failed')
+            render(output,0)
+        finally:project.close()
+        checks.append(algorithm+' scanned PDF: import, render, approved Cyrillic and export')
+        writer.encrypt('required-password', owner_password='self-test-owner', algorithm=algorithm)
+        locked=temp/(algorithm+'-locked.pdf');writer.write(locked)
+        try:read_pdf(locked)
+        except ValueError:pass
+        else:raise RuntimeError('PDF requiring a password was accepted')
+        checks.append(algorithm+' password-required PDF: rejected with a clear error')
 
 def run(report):
     checks=[];p=None
@@ -23,6 +50,7 @@ def run(report):
             output=export(p,Path(temp)/'result.pdf')
             if 'КАБЕЛЬ' not in PdfReader(output).pages[0].extract_text():raise RuntimeError('Searchable Cyrillic missing')
             render(output,0);checks.append('PDF render, approved searchable Cyrillic and export')
+            check_aes(Path(temp),p.source,checks)
             import tkinter as tk
             from app import App
             root=tk.Tk();root.withdraw();app=App(root);app.replace(p);root.update_idletasks()

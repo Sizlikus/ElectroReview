@@ -7,7 +7,7 @@ from pypdf import PdfReader, PdfWriter, Transformation
 from pypdf.annotations import Rectangle
 from pypdf.generic import RectangleObject, NameObject, ArrayObject, FloatObject, TextStringObject, NumberObject
 
-VERSION='0.2.0'
+VERSION='0.2.1'
 MAX_BYTES=100_000_000
 LABELS={'pending':'Ожидает подтверждения','approved':'Утверждено','excluded':'Исключено'}
 def now(): return datetime.now(timezone.utc).isoformat()

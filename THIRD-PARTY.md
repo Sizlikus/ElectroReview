@@ -4,6 +4,7 @@ Python: https://www.python.org/psf/license/
 Tcl/Tk: https://www.tcl.tk/software/tcltk/license.html
 pypdfium2 и PDFium: https://github.com/pypdfium2-team/pypdfium2
 pypdf: https://github.com/py-pdf/pypdf
+cryptography: https://github.com/pyca/cryptography (Apache-2.0 OR BSD-3-Clause)
 ReportLab: https://www.reportlab.com/opensource/
 Pillow: https://github.com/python-pillow/Pillow
 PyInstaller: https://pyinstaller.org/en/stable/license.html

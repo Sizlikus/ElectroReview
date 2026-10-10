@@ -1,6 +1,6 @@
 $ErrorActionPreference = 'Stop'
 if (!$env:OCR_PREFIX) { throw 'OCR_PREFIX must point to MSYS2 UCRT64' }
-python -m PyInstaller --noconfirm --clean --onedir --windowed --name ElectroReview --collect-all pypdfium2 --collect-all pypdfium2_raw --collect-all reportlab app.py
+python -m PyInstaller --noconfirm --clean --onedir --windowed --name ElectroReview --collect-all pypdfium2 --collect-all pypdfium2_raw --collect-all reportlab --collect-all cryptography app.py
 if ($LASTEXITCODE -ne 0) { throw 'PyInstaller failed' }
 $dest = 'dist/ElectroReview'
 New-Item -ItemType Directory -Force "$dest/ocr" | Out-Null

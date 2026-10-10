@@ -36,6 +36,15 @@ class Tests(unittest.TestCase):
         src=self.root/'locked.pdf'
         with src.open('wb') as f:w.write(f)
         with self.assertRaises(ValueError):Project.create(src,self.root/'locked')
+    def test_aes_scanned_import_render_export(self):
+        from selftest import check_aes
+        demo=create_demo(self.root/'aes-demo')
+        try:
+            before=demo.source.read_bytes();checks=[]
+            check_aes(self.root,demo.source,checks)
+            self.assertEqual(demo.source.read_bytes(),before)
+            self.assertEqual(len(checks),4)
+        finally:demo.close()
     def test_invalid_boxes(self):
         for b in [[0,0,2,1],[0,0,float('nan'),1],[.3,.1,.1,.2]]:
             with self.assertRaises(ValueError):box_valid(b)
